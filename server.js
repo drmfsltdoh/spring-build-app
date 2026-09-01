@@ -363,6 +363,41 @@ app.get("/api/rides/:id/messages", asyncRoute(async (req, res) => {
   res.json(messages);
 }));
 
+// One row per ride/package that ever reached a chat-capable stage (a driver
+// was actually matched), each with a preview of its most recent message —
+// this is what backs the Communication → Messages inbox screen.
+app.get("/api/inbox/:role/:id", asyncRoute(async (req, res) => {
+  const { role, id } = req.params;
+  if (!["rider", "driver"].includes(role)) throw badRequest('role must be "rider" or "driver"');
+
+  const rides = role === "rider"
+    ? await ridesCollection.find({ riderEmail: id.trim().toLowerCase() }).sort({ createdAt: -1 }).toArray()
+    : await ridesCollection.find({ driverId: toObjectId(id, "driver id") }).sort({ createdAt: -1 }).toArray();
+
+  const chattable = rides.filter((r) => ["accepted", "in_progress", "completed"].includes(r.status));
+  if (chattable.length === 0) return res.json([]);
+
+  const rideIds = chattable.map((r) => r._id);
+  const lastMessages = await messagesCollection.aggregate([
+    { $match: { rideId: { $in: rideIds } } },
+    { $sort: { createdAt: -1 } },
+    { $group: { _id: "$rideId", text: { $first: "$text" }, senderRole: { $first: "$senderRole" }, createdAt: { $first: "$createdAt" } } },
+  ]).toArray();
+  const lastMessageByRide = Object.fromEntries(
+    lastMessages.map((m) => [m._id.toString(), { text: m.text, senderRole: m.senderRole, createdAt: m.createdAt }])
+  );
+
+  res.json(chattable.map((r) => ({
+    rideId: r._id,
+    otherPartyName: role === "rider" ? r.driverName : r.riderName,
+    pickup: r.pickup,
+    destination: r.destination,
+    status: r.status,
+    type: r.type || "ride",
+    lastMessage: lastMessageByRide[r._id.toString()] || null,
+  })));
+}));
+
 // ---------- REVIEWS ----------
 
 // Rider (or driver) leaves a review after a completed ride
