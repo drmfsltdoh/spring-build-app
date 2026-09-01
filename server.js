@@ -458,30 +458,49 @@ app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
 // coming from JS — so those requests were silently failing with
 // REQUEST_DENIED and the app just showed no results. Proxying through here
 // lets us use a separate, server-side key instead.
+//
+// This uses Places API (NEW) — the legacy Places endpoints
+// (maps/api/place/...) are unavailable on newly created Google Cloud
+// projects, so New is the only reliable option going forward. Make sure
+// "Places API (New)" (NOT "Places API") is enabled for GOOGLE_PLACES_API_KEY
+// in Google Cloud Console → APIs & Services → Library.
 const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
-const PLACES_BIAS_LOCATION = "5.49,7.20"; // South-East Nigeria, Spring's operating area
-const PLACES_BIAS_RADIUS = 120000; // meters
+const PLACES_BIAS_LAT = 5.49; // South-East Nigeria, Spring's operating area
+const PLACES_BIAS_LNG = 7.20;
+const PLACES_BIAS_RADIUS = 120000.0; // meters
 
 app.get("/api/places/autocomplete", asyncRoute(async (req, res) => {
   if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
   const { query } = req.query;
   if (!query || query.trim().length < 2) return res.json({ predictions: [] });
 
-  const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(query)}&location=${PLACES_BIAS_LOCATION}&radius=${PLACES_BIAS_RADIUS}&components=country:ng&key=${PLACES_KEY}`;
-  const googleRes = await fetch(url);
-  const data = await googleRes.json();
-  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-    console.error("Places autocomplete error:", data.status, data.error_message);
-    return res.status(502).json({ error: data.error_message || data.status });
-  }
-  res.json({
-    predictions: (data.predictions || []).map((p) => ({
-      placeId: p.place_id,
-      mainText: p.structured_formatting?.main_text || p.description,
-      secondaryText: p.structured_formatting?.secondary_text || "",
-      description: p.description,
-    })),
+  const googleRes = await fetch("https://places.googleapis.com/v1/places:autocomplete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Goog-Api-Key": PLACES_KEY },
+    body: JSON.stringify({
+      input: query,
+      includedRegionCodes: ["ng"],
+      locationBias: { circle: { center: { latitude: PLACES_BIAS_LAT, longitude: PLACES_BIAS_LNG }, radius: PLACES_BIAS_RADIUS } },
+    }),
   });
+  const data = await googleRes.json();
+  if (!googleRes.ok) {
+    console.error("Places autocomplete error:", data.error?.message || data);
+    return res.status(502).json({ error: data.error?.message || "Places autocomplete failed" });
+  }
+
+  const predictions = (data.suggestions || [])
+    .filter((s) => s.placePrediction)
+    .map((s) => {
+      const p = s.placePrediction;
+      return {
+        placeId: p.placeId,
+        mainText: p.structuredFormat?.mainText?.text || p.text?.text,
+        secondaryText: p.structuredFormat?.secondaryText?.text || "",
+        description: p.text?.text,
+      };
+    });
+  res.json({ predictions });
 }));
 
 app.get("/api/places/details", asyncRoute(async (req, res) => {
@@ -489,15 +508,15 @@ app.get("/api/places/details", asyncRoute(async (req, res) => {
   const { placeId } = req.query;
   if (!placeId) throw badRequest("placeId is required");
 
-  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(placeId)}&fields=name,formatted_address,geometry&key=${PLACES_KEY}`;
-  const googleRes = await fetch(url);
+  const googleRes = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+    headers: { "X-Goog-Api-Key": PLACES_KEY, "X-Goog-FieldMask": "displayName,formattedAddress,location" },
+  });
   const data = await googleRes.json();
-  if (data.status !== "OK") {
-    console.error("Places details error:", data.status, data.error_message);
-    return res.status(502).json({ error: data.error_message || data.status });
+  if (!googleRes.ok) {
+    console.error("Places details error:", data.error?.message || data);
+    return res.status(502).json({ error: data.error?.message || "Places details failed" });
   }
-  const r = data.result;
-  res.json({ name: r.name, address: r.formatted_address, lat: r.geometry.location.lat, lng: r.geometry.location.lng });
+  res.json({ name: data.displayName?.text, address: data.formattedAddress, lat: data.location.latitude, lng: data.location.longitude });
 }));
 
 app.get("/api/places/nearby", asyncRoute(async (req, res) => {
@@ -505,20 +524,32 @@ app.get("/api/places/nearby", asyncRoute(async (req, res) => {
   const { lat, lng, radius } = req.query;
   if (!lat || !lng) throw badRequest("lat and lng are required");
 
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radius || 4000}&rankby=prominence&key=${PLACES_KEY}`;
-  const googleRes = await fetch(url);
+  const googleRes = await fetch("https://places.googleapis.com/v1/places:searchNearby", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": PLACES_KEY,
+      "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.rating",
+    },
+    body: JSON.stringify({
+      locationRestriction: { circle: { center: { latitude: parseFloat(lat), longitude: parseFloat(lng) }, radius: parseFloat(radius) || 4000.0 } },
+      rankPreference: "POPULARITY",
+      maxResultCount: 10,
+    }),
+  });
   const data = await googleRes.json();
-  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
-    console.error("Places nearby error:", data.status, data.error_message);
-    return res.status(502).json({ error: data.error_message || data.status });
+  if (!googleRes.ok) {
+    console.error("Places nearby error:", data.error?.message || data);
+    return res.status(502).json({ error: data.error?.message || "Places nearby failed" });
   }
+
   res.json({
-    results: (data.results || []).slice(0, 10).map((r) => ({
-      placeId: r.place_id,
-      name: r.name,
-      lat: r.geometry.location.lat,
-      lng: r.geometry.location.lng,
-      rating: r.rating,
+    results: (data.places || []).map((p) => ({
+      placeId: p.id,
+      name: p.displayName?.text,
+      lat: p.location?.latitude,
+      lng: p.location?.longitude,
+      rating: p.rating,
     })),
   });
 }));
