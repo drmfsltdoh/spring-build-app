@@ -30,6 +30,8 @@ let usersCollection;
 let driversCollection;
 let messagesCollection;
 let reviewsCollection;
+let walletsCollection;
+let walletTransactionsCollection;
 
 async function connectToDatabase() {
   await client.connect();
@@ -39,6 +41,8 @@ async function connectToDatabase() {
   driversCollection = db.collection("drivers");
   messagesCollection = db.collection("messages");
   reviewsCollection = db.collection("reviews");
+  walletsCollection = db.collection("wallets");
+  walletTransactionsCollection = db.collection("walletTransactions");
 
   // Keep signups unique and lookups fast. safe to run every boot — no-ops if they already exist.
   await usersCollection.createIndex({ email: 1 }, { unique: true });
@@ -46,6 +50,8 @@ async function connectToDatabase() {
   await ridesCollection.createIndex({ driverId: 1, createdAt: -1 });
   await ridesCollection.createIndex({ riderEmail: 1, createdAt: -1 });
   await messagesCollection.createIndex({ rideId: 1, createdAt: 1 });
+  await walletsCollection.createIndex({ email: 1 }, { unique: true });
+  await walletTransactionsCollection.createIndex({ email: 1, createdAt: -1 });
 
   console.log("Connected to MongoDB!");
 }
@@ -90,7 +96,7 @@ app.get("/", (req, res) => {
 // ---------- AUTH ----------
 
 app.post("/api/signup", asyncRoute(async (req, res) => {
-  const { name, email, password, role, car, plate, vehicleType } = req.body;
+  const { name, email, password, role, phone, car, plate, vehicleType } = req.body;
   if (!name || !email || !password || !role) {
     throw badRequest("name, email, password and role are required");
   }
@@ -111,8 +117,12 @@ app.post("/api/signup", asyncRoute(async (req, res) => {
   }
 
   const hashedPassword = await bcrypt.hash(password, 10);
-  const newUser = { name: name.trim(), email: normalizedEmail, password: hashedPassword, role };
+  const newUser = { name: name.trim(), email: normalizedEmail, password: hashedPassword, role, phone: phone?.trim() || null };
   const result = await usersCollection.insertOne(newUser);
+
+  // Every rider (and driver) gets a Spring Wallet the moment they sign up,
+  // starting at ₦0 — this is what backs the Payments → Spring Wallet screen.
+  await walletsCollection.insertOne({ email: normalizedEmail, balance: 0, createdAt: new Date() });
 
   // If signing up as a driver, also create their driver profile
   let driverId;
@@ -131,7 +141,7 @@ app.post("/api/signup", asyncRoute(async (req, res) => {
     driverId = driverResult.insertedId;
   }
 
-  res.json({ message: "Signup successful!", name: newUser.name, email: normalizedEmail, role, driverId, vehicleType: role === "driver" ? (vehicleType || "economy") : undefined });
+  res.json({ message: "Signup successful!", name: newUser.name, email: normalizedEmail, phone: newUser.phone, role, driverId, vehicleType: role === "driver" ? (vehicleType || "economy") : undefined });
 }));
 
 app.post("/api/login", asyncRoute(async (req, res) => {
@@ -157,7 +167,37 @@ app.post("/api/login", asyncRoute(async (req, res) => {
     vehicleType = driverProfile?.vehicleType;
   }
 
-  res.json({ message: "Login successful!", name: user.name, email: user.email, role: user.role, driverId, vehicleType });
+  // Backfill a wallet for accounts created before wallets existed.
+  await walletsCollection.updateOne(
+    { email: normalizedEmail },
+    { $setOnInsert: { email: normalizedEmail, balance: 0, createdAt: new Date() } },
+    { upsert: true }
+  );
+
+  res.json({ message: "Login successful!", name: user.name, email: user.email, phone: user.phone || null, role: user.role, driverId, vehicleType });
+}));
+
+// Update name/phone from the Profile screen.
+app.patch("/api/profile", asyncRoute(async (req, res) => {
+  const { email, name, phone } = req.body;
+  if (!email) throw badRequest("email is required");
+  const update = {};
+  if (typeof name === "string" && name.trim()) update.name = name.trim();
+  if (typeof phone === "string") update.phone = phone.trim() || null;
+  if (Object.keys(update).length === 0) throw badRequest("Nothing to update");
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const result = await usersCollection.findOneAndUpdate(
+    { email: normalizedEmail },
+    { $set: update },
+    { returnDocument: "after" }
+  );
+  if (!result) return res.status(404).json({ error: "User not found" });
+  // Keep the driver profile's display name in sync too, if this user is a driver.
+  if (update.name) {
+    await driversCollection.updateOne({ email: normalizedEmail }, { $set: { name: update.name } });
+  }
+  res.json({ message: "Profile updated", name: result.name, phone: result.phone || null });
 }));
 
 // ---------- DRIVERS ----------
@@ -410,7 +450,170 @@ app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
   });
 }));
 
-// ---------- 404 + error handling ----------
+// ---------- PLACES (server-side proxy for Google Places) ----------
+// The mobile app used to call Google's Places Web Service directly with the
+// same key given to the Android Maps SDK. That key is (correctly)
+// restricted to the Android app's package name + SHA-1 fingerprint, which
+// Google can verify for native SDK calls but NOT for a plain HTTPS request
+// coming from JS — so those requests were silently failing with
+// REQUEST_DENIED and the app just showed no results. Proxying through here
+// lets us use a separate, server-side key instead.
+const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
+const PLACES_BIAS_LOCATION = "5.49,7.20"; // South-East Nigeria, Spring's operating area
+const PLACES_BIAS_RADIUS = 120000; // meters
+
+app.get("/api/places/autocomplete", asyncRoute(async (req, res) => {
+  if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
+  const { query } = req.query;
+  if (!query || query.trim().length < 2) return res.json({ predictions: [] });
+
+  const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(query)}&location=${PLACES_BIAS_LOCATION}&radius=${PLACES_BIAS_RADIUS}&components=country:ng&key=${PLACES_KEY}`;
+  const googleRes = await fetch(url);
+  const data = await googleRes.json();
+  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
+    console.error("Places autocomplete error:", data.status, data.error_message);
+    return res.status(502).json({ error: data.error_message || data.status });
+  }
+  res.json({
+    predictions: (data.predictions || []).map((p) => ({
+      placeId: p.place_id,
+      mainText: p.structured_formatting?.main_text || p.description,
+      secondaryText: p.structured_formatting?.secondary_text || "",
+      description: p.description,
+    })),
+  });
+}));
+
+app.get("/api/places/details", asyncRoute(async (req, res) => {
+  if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
+  const { placeId } = req.query;
+  if (!placeId) throw badRequest("placeId is required");
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(placeId)}&fields=name,formatted_address,geometry&key=${PLACES_KEY}`;
+  const googleRes = await fetch(url);
+  const data = await googleRes.json();
+  if (data.status !== "OK") {
+    console.error("Places details error:", data.status, data.error_message);
+    return res.status(502).json({ error: data.error_message || data.status });
+  }
+  const r = data.result;
+  res.json({ name: r.name, address: r.formatted_address, lat: r.geometry.location.lat, lng: r.geometry.location.lng });
+}));
+
+app.get("/api/places/nearby", asyncRoute(async (req, res) => {
+  if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
+  const { lat, lng, radius } = req.query;
+  if (!lat || !lng) throw badRequest("lat and lng are required");
+
+  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${radius || 4000}&rankby=prominence&key=${PLACES_KEY}`;
+  const googleRes = await fetch(url);
+  const data = await googleRes.json();
+  if (data.status !== "OK" && data.status !== "ZERO_RESULTS") {
+    console.error("Places nearby error:", data.status, data.error_message);
+    return res.status(502).json({ error: data.error_message || data.status });
+  }
+  res.json({
+    results: (data.results || []).slice(0, 10).map((r) => ({
+      placeId: r.place_id,
+      name: r.name,
+      lat: r.geometry.location.lat,
+      lng: r.geometry.location.lng,
+      rating: r.rating,
+    })),
+  });
+}));
+
+// ---------- SPRING WALLET ----------
+// A simple in-house balance + ledger. There's no real payment processor
+// wired in yet, so "Top up" here is a manual/simulated credit (clearly
+// labeled as such to the rider) rather than a real card charge — swap the
+// topup handler for a real payment gateway webhook when Spring adds one.
+
+app.get("/api/wallet/:email", asyncRoute(async (req, res) => {
+  const normalizedEmail = req.params.email.trim().toLowerCase();
+  const wallet = await walletsCollection.findOneAndUpdate(
+    { email: normalizedEmail },
+    { $setOnInsert: { email: normalizedEmail, balance: 0, createdAt: new Date() } },
+    { upsert: true, returnDocument: "after" }
+  );
+  const transactions = await walletTransactionsCollection
+    .find({ email: normalizedEmail })
+    .sort({ createdAt: -1 })
+    .limit(50)
+    .toArray();
+  res.json({ balance: wallet.balance, transactions });
+}));
+
+app.post("/api/wallet/:email/topup", asyncRoute(async (req, res) => {
+  const normalizedEmail = req.params.email.trim().toLowerCase();
+  const { amount } = req.body;
+  if (typeof amount !== "number" || amount <= 0) throw badRequest("amount must be a positive number");
+
+  await walletsCollection.updateOne(
+    { email: normalizedEmail },
+    { $setOnInsert: { email: normalizedEmail, createdAt: new Date() }, $inc: { balance: Math.round(amount) } },
+    { upsert: true }
+  );
+  const tx = {
+    email: normalizedEmail,
+    type: "topup",
+    amount: Math.round(amount),
+    note: "Wallet top-up (simulated — no real payment gateway connected yet)",
+    createdAt: new Date(),
+  };
+  await walletTransactionsCollection.insertOne(tx);
+  const wallet = await walletsCollection.findOne({ email: normalizedEmail });
+  res.json({ message: "Wallet topped up", balance: wallet.balance, transaction: tx });
+}));
+
+// ---------- SPRING SEND (package / waybill delivery) ----------
+// Reuses the ridesCollection so the whole accept/decline/status/chat
+// pipeline built for rides works unchanged for packages — a package is
+// just a ride with type: "package" plus a few package-only fields.
+
+app.post("/api/packages/request", asyncRoute(async (req, res) => {
+  const { riderEmail, riderName, driverId, pickup, destination, size, price, recipientName, recipientPhone, note } = req.body;
+  if (!riderEmail || !driverId || !pickup?.trim() || !destination?.trim() || !size) {
+    throw badRequest("riderEmail, driverId, pickup, destination and size are required");
+  }
+  if (!["small", "medium", "large"].includes(size)) {
+    throw badRequest('size must be "small", "medium" or "large"');
+  }
+
+  const driver = await driversCollection.findOne({ _id: toObjectId(driverId, "driver id") });
+  if (!driver || !driver.online) {
+    throw badRequest("That driver is no longer available");
+  }
+
+  const newPackage = {
+    type: "package",
+    riderEmail: riderEmail.trim().toLowerCase(),
+    riderName,
+    driverId: driver._id,
+    driverName: driver.name,
+    pickup: pickup.trim(),
+    destination: destination.trim(),
+    packageSize: size,
+    recipientName: recipientName?.trim() || null,
+    recipientPhone: recipientPhone?.trim() || null,
+    note: note?.trim().slice(0, 500) || null,
+    estimatedFare: typeof price === "number" ? Math.round(price) : null,
+    status: "requested",
+    distanceKm: null,
+    fare: null,
+    createdAt: new Date(),
+  };
+  const result = await ridesCollection.insertOne(newPackage);
+  res.json({ message: "Package requested!", id: result.insertedId, ride: { ...newPackage, _id: result.insertedId } });
+}));
+
+app.get("/api/packages/rider/:riderEmail", asyncRoute(async (req, res) => {
+  const packages = await ridesCollection
+    .find({ riderEmail: req.params.riderEmail.trim().toLowerCase(), type: "package" })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.json(packages);
+}));
 
 app.use((req, res) => {
   res.status(404).json({ error: "Not found" });
