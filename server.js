@@ -467,7 +467,7 @@ app.get("/api/driver/:id/summary", asyncRoute(async (req, res) => {
 const PLACES_KEY = process.env.GOOGLE_PLACES_API_KEY;
 const PLACES_BIAS_LAT = 5.49; // South-East Nigeria, Spring's operating area
 const PLACES_BIAS_LNG = 7.20;
-const PLACES_BIAS_RADIUS = 120000.0; // meters
+const PLACES_BIAS_RADIUS = 50000.0; // meters — Google's max allowed for locationBias.circle
 
 app.get("/api/places/autocomplete", asyncRoute(async (req, res) => {
   if (!PLACES_KEY) return res.status(500).json({ error: "GOOGLE_PLACES_API_KEY is not configured on the server" });
